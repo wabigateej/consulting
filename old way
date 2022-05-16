@@ -1,0 +1,101 @@
+--creates min and max values for outer bounds of date series
+with range_values as(
+select date_trunc('month',pswh.min) as minval,
+       date_trunc('month',pswh.max) as maxval
+from (select min(created_at)::date as min, max(created_at)::date as max from paysafe_webhooks pswh) pswh),
+
+--creates date series range (started with day, moved to month to save space)
+range as (
+select generate_series(minval,maxval, '1 month'::interval) as day
+from range_values),
+
+--cross join to create a record for every combination of paysafe_webhook account_number and week/day
+x as (
+  select
+    range.day
+    ,account_number
+  from range, (select distinct notification->'payload'->>'accountNumber' as account_number from paysafe_webhooks) pswh),
+ 
+--select distinct on to pull only final status based on the week/day - If an account number changes from statuses in the same time period, it will only pull the last status
+z as (SELECT distinct on (pp.account_id,pp.provider_account_id)
+	pp.account_id,
+	pp.provider_account_id,
+	case when pswh.notification->'payload'->>'acctStatus' = 'Enabled' then 'Boarded' else pswh.notification->'payload'->>'acctStatus' end as status -- changes "Enabled" to "Boarded"
+	,min(pswh.created_at) as created_at
+FROM (select pp.*,a.type from payment_providers pp join accounts a on pp.account_id = a.id and a.type != 'partner') pp
+INNER JOIN product_codes pc
+ON pp.product_code_id = pc.id
+LEFT JOIN paysafe_webhooks pswh
+ON pp.provider_account_id = notification->'payload'->>'accountNumber'
+Where pswh.notification->'payload'->>'acctStatus' is not null 
+group by 1,2,3
+
+UNION ALL
+
+--same select distinct on in order to pull last status. UNION records from paysafe_webhooks for application status 
+--and charges/refunds for "Boarded" and "Active" Statuses. 
+--"Boarded" means able to process transactions but haven't processed $20. "Active" means processed >$20 
+select distinct on (z.account_id,z.provider_account_id)
+z.account_id
+,z.provider_account_id
+,case when current_status = 'Enabled' then 'Boarded' else current_status end as status
+,min(z.created_at) as created_at
+from (select
+x.*
+,sum(net_amount) over (partition by provider_account_id order by provider_account_id,created_at rows between unbounded preceding and current row) as running_total
+,case when sum(net_amount) over (partition by provider_account_id order by provider_account_id,created_at rows between unbounded preceding and current row) >= 20 then 'Active' else 'Boarded' end as current_status
+from(select
+  pi.account_id
+  ,pi.created_at
+  ,pp.provider_account_id
+  ,pm.type
+  ,pi.currency
+  ,coalesce(c.amount_captured/100,0) as charge
+  ,coalesce(r.amount/100,0) as refund
+  ,sum((coalesce(c.amount_captured,0) - coalesce(r.amount,0))/100.00) as net_amount
+from payment_intents pi
+left join (select * from charges where status = 'succeeded') c on pi.id = c.payment_intent_id
+left join (select * from refunds where status = 'succeeded') r	on pi.id = r.payment_intent_id
+left join payment_methods pm on pi.payment_method_id = pm.id
+left join (select pp.*,a.type from payment_providers pp join accounts a on pp.account_id = a.id and a.type != 'partner') pp on pm.payment_provider_id = pp.id
+join product_codes pc on pp.product_code_id = pc.id
+group by 1,2,3,4,5,6,7) x) z
+group by 1,2,3
+order by 2,4
+)
+--select isv.name,a.name,z.* from z left join accounts a on z.account_id = a.id left join accounts isv on a.parent_account_id = isv.id --where a.name = 'Meter Music School'
+ ,
+
+-- one more distinct on in order to compare statuses across application status vs. boarded/active. only want to pull the last status for this time series record
+zz as(select distinct on (x.day,x.account_number)
+x.day
+,x.account_number
+,z.account_id
+,z.status
+,z.created_at
+,max(z.created_at) over (partition by account_number order by day,created_at rows between unbounded preceding and current row) as running_created
+from x
+left join z on z.provider_account_id = x.account_number and x.day::date = date_trunc('month',z.created_at)::date
+) 
+select isv.name, zz.* from zz left join accounts a on zz.account_id = a.id left join accounts isv on a.parent_account_id = isv.id 
+--final select to show english identifying info based on zz.
+select 
+zz.day
+,zz.account_number
+,pp.provider_account_id
+,pp.account_id
+,a.name as account_name
+,isv.name as isv_name
+,pc.currency
+,pc.payment_method_type
+,zz.status
+,zz.created_at
+,z.status as running_status
+from zz
+left join z on zz.running_created = z.created_at
+left join (select pp.*,a.type from payment_providers pp join accounts a on pp.account_id = a.id and a.type != 'partner') pp on zz.account_number = pp.provider_account_id
+left join product_codes pc on pp.product_code_id = pc.id
+left join accounts a on pp.account_id = a.id
+left join accounts isv on a.parent_account_id = isv.id
+where z.status is not null and pp.account_id != 'acct_RUs5RNyrb9VrDoA1ZbOIZ'
+order by 2,1
