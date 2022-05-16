@@ -58,26 +58,29 @@ left join (select * from charges where status = 'succeeded') c on pi.id = c.paym
 left join (select * from refunds where status = 'succeeded') r	on pi.id = r.payment_intent_id
 left join payment_methods pm on pi.payment_method_id = pm.id
 left join (select pp.*,a.type from payment_providers pp join accounts a on pp.account_id = a.id and a.type != 'partner') pp on pm.payment_provider_id = pp.id
-join product_codes pc on pp.product_code_id = pc.id
+join product_codes pc on pp.product_code_id = pc.id 
 group by 1,2,3,4,5,6,7) x) z
 group by 1,2,3
 order by 2,4
 )
---select isv.name,a.name,z.* from z left join accounts a on z.account_id = a.id left join accounts isv on a.parent_account_id = isv.id --where a.name = 'Meter Music School'
+select isv.name,a.name,z.* from z left join accounts a on z.account_id = a.id left join accounts isv on a.parent_account_id = isv.id 
  ,
 
 -- one more distinct on in order to compare statuses across application status vs. boarded/active. only want to pull the last status for this time series record
 zz as(select distinct on (x.day,x.account_number)
 x.day
 ,x.account_number
+,z.provider_account_id
 ,z.account_id
 ,z.status
 ,z.created_at
-,max(z.created_at) over (partition by account_number order by day,created_at rows between unbounded preceding and current row) as running_created
+,max(z.created_at) over (partition by provider_account_id order by day,created_at rows between unbounded preceding and current row) as running_created
 from x
 left join z on z.provider_account_id = x.account_number and x.day::date = date_trunc('month',z.created_at)::date
-) 
-select isv.name, zz.* from zz left join accounts a on zz.account_id = a.id left join accounts isv on a.parent_account_id = isv.id 
+)
+
+--select isv.name, zz.* from zz left join accounts a on zz.account_id = a.id left join accounts isv on a.parent_account_id = isv.id 
+
 --final select to show english identifying info based on zz.
 select 
 zz.day
